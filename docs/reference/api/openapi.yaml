@@ -61,6 +61,18 @@ paths:
           schema:
             type: string
             example: "1.2.3"
+        - name: type
+          in: query
+          description: |
+            Filter by distribution type. Allows discovering servers based on how they are made available to users.
+
+            Example values include: 'remote', 'npm', 'pypi', 'oci', 'nuget', 'mcpb'
+
+            Note: Servers with multiple package types or both remotes and packages will appear in results for all matching type filters.
+          required: false
+          schema:
+            type: string
+            example: "remote"
       responses:
         '200':
           description: A list of MCP servers
