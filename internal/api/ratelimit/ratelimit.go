@@ -3,6 +3,7 @@ package ratelimit
 
 import (
 	"encoding/json"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -22,6 +23,13 @@ type Config struct {
 	CleanupInterval time.Duration
 	// SkipPaths are paths that should not be rate limited
 	SkipPaths []string
+	// TrustProxy determines if X-Forwarded-For and X-Real-IP headers should be trusted.
+	// Set to true only when running behind a trusted reverse proxy (e.g., nginx, cloud load balancer).
+	// When false, only the direct connection IP (RemoteAddr) is used, preventing IP spoofing.
+	TrustProxy bool
+	// MaxVisitors is the maximum number of visitor entries to track (memory protection).
+	// When exceeded, oldest entries are evicted. Default: 100000.
+	MaxVisitors int
 }
 
 // DefaultConfig returns the default rate limiting configuration
@@ -31,6 +39,8 @@ func DefaultConfig() Config {
 		RequestsPerHour:   1000,
 		CleanupInterval:   10 * time.Minute,
 		SkipPaths:         []string{"/health", "/ping", "/metrics"},
+		TrustProxy:        false, // Secure default: don't trust proxy headers
+		MaxVisitors:       100000,
 	}
 }
 
@@ -51,6 +61,10 @@ type RateLimiter struct {
 
 // New creates a new RateLimiter with the given configuration
 func New(cfg Config) *RateLimiter {
+	if cfg.MaxVisitors <= 0 {
+		cfg.MaxVisitors = 100000
+	}
+
 	rl := &RateLimiter{
 		config:   cfg,
 		visitors: make(map[string]*visitor),
@@ -96,28 +110,65 @@ func (rl *RateLimiter) cleanup() {
 	}
 }
 
-// getVisitor returns the visitor for the given IP, creating one if necessary
+// evictOldestLocked removes the oldest visitor entry. Must be called with lock held.
+func (rl *RateLimiter) evictOldestLocked() {
+	var oldestIP string
+	var oldestTime time.Time
+
+	for ip, v := range rl.visitors {
+		if oldestIP == "" || v.lastSeen.Before(oldestTime) {
+			oldestIP = ip
+			oldestTime = v.lastSeen
+		}
+	}
+
+	if oldestIP != "" {
+		delete(rl.visitors, oldestIP)
+	}
+}
+
+// getVisitor returns the visitor for the given IP, creating one if necessary.
+// Implements memory protection by evicting oldest entries when MaxVisitors is reached.
 func (rl *RateLimiter) getVisitor(ip string) *visitor {
+	// Try read lock first for existing visitors (common case)
+	rl.mu.RLock()
+	v, exists := rl.visitors[ip]
+	rl.mu.RUnlock()
+
+	if exists {
+		// Update timestamp - this is a minor race but acceptable for lastSeen
+		v.lastSeen = time.Now()
+		return v
+	}
+
+	// Need to create new visitor - acquire write lock
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
-	v, exists := rl.visitors[ip]
-	if !exists {
-		// Create rate limiters:
-		// - Minute limiter: allows RequestsPerMinute requests per minute with burst of same
-		// - Hour limiter: allows RequestsPerHour requests per hour with burst of same
-		minuteRate := rate.Limit(float64(rl.config.RequestsPerMinute) / 60.0) // requests per second
-		hourRate := rate.Limit(float64(rl.config.RequestsPerHour) / 3600.0)   // requests per second
-
-		v = &visitor{
-			minuteLimiter: rate.NewLimiter(minuteRate, rl.config.RequestsPerMinute),
-			hourLimiter:   rate.NewLimiter(hourRate, rl.config.RequestsPerHour),
-			lastSeen:      time.Now(),
-		}
-		rl.visitors[ip] = v
-	} else {
+	// Double-check after acquiring write lock
+	v, exists = rl.visitors[ip]
+	if exists {
 		v.lastSeen = time.Now()
+		return v
 	}
+
+	// Enforce max visitors limit (memory protection)
+	if len(rl.visitors) >= rl.config.MaxVisitors {
+		rl.evictOldestLocked()
+	}
+
+	// Create rate limiters:
+	// - Minute limiter: allows RequestsPerMinute requests per minute with burst of same
+	// - Hour limiter: allows RequestsPerHour requests per hour with burst of same
+	minuteRate := rate.Limit(float64(rl.config.RequestsPerMinute) / 60.0) // requests per second
+	hourRate := rate.Limit(float64(rl.config.RequestsPerHour) / 3600.0)   // requests per second
+
+	v = &visitor{
+		minuteLimiter: rate.NewLimiter(minuteRate, rl.config.RequestsPerMinute),
+		hourLimiter:   rate.NewLimiter(hourRate, rl.config.RequestsPerHour),
+		lastSeen:      time.Now(),
+	}
+	rl.visitors[ip] = v
 
 	return v
 }
@@ -146,33 +197,63 @@ func (rl *RateLimiter) shouldSkip(path string) bool {
 	return false
 }
 
-// getClientIP extracts the client IP from the request
-// It considers X-Forwarded-For and X-Real-IP headers for reverse proxy scenarios
-func getClientIP(r *http.Request) string {
-	// Check X-Forwarded-For header (can contain multiple IPs)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP (original client)
-		if idx := strings.Index(xff, ","); idx != -1 {
-			xff = xff[:idx]
+// getClientIP extracts the client IP from the request.
+// When TrustProxy is true, it considers X-Forwarded-For and X-Real-IP headers.
+// When TrustProxy is false, only RemoteAddr is used to prevent IP spoofing.
+func (rl *RateLimiter) getClientIP(r *http.Request) string {
+	// Only trust proxy headers if explicitly configured
+	if rl.config.TrustProxy {
+		// Check X-Forwarded-For header (can contain multiple IPs)
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// Take the first IP (original client)
+			if idx := strings.Index(xff, ","); idx != -1 {
+				xff = xff[:idx]
+			}
+			xff = strings.TrimSpace(xff)
+			if ip := validateAndNormalizeIP(xff); ip != "" {
+				return ip
+			}
 		}
-		xff = strings.TrimSpace(xff)
-		if xff != "" {
-			return xff
+
+		// Check X-Real-IP header
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			if ip := validateAndNormalizeIP(strings.TrimSpace(xri)); ip != "" {
+				return ip
+			}
 		}
 	}
 
-	// Check X-Real-IP header
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
-	}
-
-	// Fall back to RemoteAddr
+	// Fall back to RemoteAddr (always used when TrustProxy is false)
 	ip, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		// RemoteAddr might not have a port
-		return r.RemoteAddr
+		ip = r.RemoteAddr
 	}
-	return ip
+
+	// Validate and normalize the IP
+	if validIP := validateAndNormalizeIP(ip); validIP != "" {
+		return validIP
+	}
+
+	// If all else fails, use a fallback that won't cause issues
+	return "unknown"
+}
+
+// validateAndNormalizeIP validates the IP string and returns a normalized form.
+// Returns empty string if the IP is invalid.
+func validateAndNormalizeIP(ip string) string {
+	if ip == "" {
+		return ""
+	}
+
+	// Parse the IP to validate it
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return ""
+	}
+
+	// Return normalized string representation
+	return parsedIP.String()
 }
 
 // Middleware returns an HTTP middleware that enforces rate limiting
@@ -184,7 +265,7 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 			return
 		}
 
-		ip := getClientIP(r)
+		ip := rl.getClientIP(r)
 
 		if !rl.Allow(ip) {
 			w.Header().Set("Content-Type", "application/problem+json")
@@ -199,7 +280,8 @@ func (rl *RateLimiter) Middleware(next http.Handler) http.Handler {
 
 			jsonData, err := json.Marshal(errorBody)
 			if err != nil {
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+				log.Printf("Failed to marshal rate limit error response: %v", err)
+				_, _ = w.Write([]byte(`{"title":"Too Many Requests","status":429}`))
 				return
 			}
 			_, _ = w.Write(jsonData)

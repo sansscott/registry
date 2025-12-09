@@ -29,6 +29,7 @@ type Config struct {
 	RateLimitEnabled           bool `env:"RATE_LIMIT_ENABLED" envDefault:"true"`
 	RateLimitRequestsPerMinute int  `env:"RATE_LIMIT_REQUESTS_PER_MINUTE" envDefault:"60"`
 	RateLimitRequestsPerHour   int  `env:"RATE_LIMIT_REQUESTS_PER_HOUR" envDefault:"1000"`
+	RateLimitTrustProxy        bool `env:"RATE_LIMIT_TRUST_PROXY" envDefault:"false"`
 }
 
 // NewConfig creates a new configuration with default values
