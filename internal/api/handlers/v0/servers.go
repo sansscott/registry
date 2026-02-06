@@ -3,6 +3,7 @@ package v0
 import (
 	"context"
 	"errors"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -86,6 +87,12 @@ func RegisterServersEndpoints(api huma.API, pathPrefix string, registry service.
 		servers, nextCursor, err := registry.ListServers(ctx, filter, input.Cursor, input.Limit)
 		if err != nil {
 			return nil, huma.Error500InternalServerError("Failed to get registry list", err)
+		}
+
+		// Log when returning 0 servers with no cursor and no filters
+		// This helps track down issues where clients successfully fetch but get no results
+		if len(servers) == 0 && input.Cursor == "" && input.UpdatedSince == "" && input.Search == "" && input.Version == "" {
+			log.Printf("ERROR: ListServers returned 0 servers with no filters applied")
 		}
 
 		// Convert []*ServerResponse to []ServerResponse
