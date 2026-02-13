@@ -392,6 +392,246 @@ func TestGetAllVersionsEndpoint(t *testing.T) {
 	}
 }
 
+func TestListServersWithFilter(t *testing.T) {
+	ctx := context.Background()
+	registryService := service.NewRegistryService(database.NewTestDB(t), &config.Config{EnableRegistryValidation: false})
+
+	// Setup test data: servers with different distribution types
+	// Server with SSE remote
+	_, err := registryService.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/sse-server",
+		Description: "Server with SSE remote",
+		Version:     "1.0.0",
+		Remotes: []model.Transport{
+			{Type: model.TransportTypeSSE, URL: "https://example.com/sse"},
+		},
+	})
+	require.NoError(t, err)
+
+	// Server with streamable-http remote
+	_, err = registryService.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/streamable-server",
+		Description: "Server with streamable-http remote",
+		Version:     "1.0.0",
+		Remotes: []model.Transport{
+			{Type: model.TransportTypeStreamableHTTP, URL: "https://example.com/mcp"},
+		},
+	})
+	require.NoError(t, err)
+
+	// Server with npm package
+	_, err = registryService.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/npm-server",
+		Description: "Server with npm package",
+		Version:     "1.0.0",
+		Packages: []model.Package{
+			{
+				RegistryType: model.RegistryTypeNPM,
+				Identifier:   "@example/mcp-server",
+				Version:      "1.0.0",
+				Transport:    model.Transport{Type: model.TransportTypeStdio},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	// Server with pypi package
+	_, err = registryService.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/pypi-server",
+		Description: "Server with pypi package",
+		Version:     "1.0.0",
+		Packages: []model.Package{
+			{
+				RegistryType: model.RegistryTypePyPI,
+				Identifier:   "example-mcp-server",
+				Version:      "1.0.0",
+				Transport:    model.Transport{Type: model.TransportTypeStdio},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	// Server with both remote and package (matches multiple filters)
+	_, err = registryService.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/multi-server",
+		Description: "Server with both SSE and npm",
+		Version:     "1.0.0",
+		Remotes: []model.Transport{
+			{Type: model.TransportTypeSSE, URL: "https://example.com/multi/sse"},
+		},
+		Packages: []model.Package{
+			{
+				RegistryType: model.RegistryTypeNPM,
+				Identifier:   "@example/multi-server",
+				Version:      "1.0.0",
+				Transport:    model.Transport{Type: model.TransportTypeStdio},
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	// Server with no remotes or packages (should not match any filter)
+	_, err = registryService.CreateServer(ctx, &apiv0.ServerJSON{
+		Schema:      model.CurrentSchemaURL,
+		Name:        "com.example/bare-server",
+		Description: "Server with no distribution",
+		Version:     "1.0.0",
+	})
+	require.NoError(t, err)
+
+	// Create API
+	mux := http.NewServeMux()
+	api := humago.New(mux, huma.DefaultConfig("Test API", "1.0.0"))
+	v0.RegisterServersEndpoints(api, "/v0", registryService)
+
+	tests := []struct {
+		name            string
+		queryParams     string
+		expectedStatus  int
+		expectedCount   int
+		expectedError   string
+		expectedServers []string // server names expected in results
+	}{
+		{
+			name:           "filter by sse",
+			queryParams:    "?filter=sse",
+			expectedStatus: http.StatusOK,
+			expectedCount:  2, // sse-server + multi-server
+			expectedServers: []string{
+				"com.example/sse-server",
+				"com.example/multi-server",
+			},
+		},
+		{
+			name:           "filter by streamable-http",
+			queryParams:    "?filter=streamable-http",
+			expectedStatus: http.StatusOK,
+			expectedCount:  1,
+			expectedServers: []string{
+				"com.example/streamable-server",
+			},
+		},
+		{
+			name:           "filter by npm",
+			queryParams:    "?filter=npm",
+			expectedStatus: http.StatusOK,
+			expectedCount:  2, // npm-server + multi-server
+			expectedServers: []string{
+				"com.example/npm-server",
+				"com.example/multi-server",
+			},
+		},
+		{
+			name:           "filter by pypi",
+			queryParams:    "?filter=pypi",
+			expectedStatus: http.StatusOK,
+			expectedCount:  1,
+			expectedServers: []string{
+				"com.example/pypi-server",
+			},
+		},
+		{
+			name:           "comma-separated filters (npm,pypi) - OR logic",
+			queryParams:    "?filter=npm,pypi",
+			expectedStatus: http.StatusOK,
+			expectedCount:  3, // npm-server + pypi-server + multi-server
+			expectedServers: []string{
+				"com.example/npm-server",
+				"com.example/pypi-server",
+				"com.example/multi-server",
+			},
+		},
+		{
+			name:           "comma-separated filters (sse,npm) - OR logic across types",
+			queryParams:    "?filter=sse,npm",
+			expectedStatus: http.StatusOK,
+			expectedCount:  3, // sse-server + npm-server + multi-server (has both)
+			expectedServers: []string{
+				"com.example/sse-server",
+				"com.example/npm-server",
+				"com.example/multi-server",
+			},
+		},
+		{
+			name:           "invalid filter value",
+			queryParams:    "?filter=invalid",
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "Invalid filter value",
+		},
+		{
+			name:           "partially invalid filter value",
+			queryParams:    "?filter=npm,invalid",
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "Invalid filter value",
+		},
+		{
+			name:           "filter combined with search",
+			queryParams:    "?filter=npm&search=multi",
+			expectedStatus: http.StatusOK,
+			expectedCount:  1,
+			expectedServers: []string{
+				"com.example/multi-server",
+			},
+		},
+		{
+			name:           "filter combined with version=latest",
+			queryParams:    "?filter=sse&version=latest",
+			expectedStatus: http.StatusOK,
+			expectedCount:  2,
+			expectedServers: []string{
+				"com.example/sse-server",
+				"com.example/multi-server",
+			},
+		},
+		{
+			name:           "filter with spaces around values",
+			queryParams:    "?filter=npm%2C%20pypi", // "npm, pypi" URL-encoded
+			expectedStatus: http.StatusOK,
+			expectedCount:  3,
+		},
+		{
+			name:           "filter by oci (no matching servers)",
+			queryParams:    "?filter=oci",
+			expectedStatus: http.StatusOK,
+			expectedCount:  0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/v0/servers"+tt.queryParams, nil)
+			w := httptest.NewRecorder()
+
+			mux.ServeHTTP(w, req)
+
+			assert.Equal(t, tt.expectedStatus, w.Code)
+
+			if tt.expectedStatus == http.StatusOK {
+				var resp apiv0.ServerListResponse
+				err := json.NewDecoder(w.Body).Decode(&resp)
+				assert.NoError(t, err)
+				assert.Len(t, resp.Servers, tt.expectedCount)
+				assert.Equal(t, tt.expectedCount, resp.Metadata.Count)
+
+				if tt.expectedServers != nil {
+					actualNames := make([]string, len(resp.Servers))
+					for i, s := range resp.Servers {
+						actualNames[i] = s.Server.Name
+					}
+					assert.ElementsMatch(t, tt.expectedServers, actualNames)
+				}
+			} else if tt.expectedError != "" {
+				assert.Contains(t, w.Body.String(), tt.expectedError)
+			}
+		})
+	}
+}
+
 func TestServersEndpointEdgeCases(t *testing.T) {
 	ctx := context.Background()
 	registryService := service.NewRegistryService(database.NewTestDB(t), config.NewConfig())

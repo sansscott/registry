@@ -79,6 +79,87 @@ func NewPostgreSQL(ctx context.Context, connectionURI string) (*PostgreSQL, erro
 	}, nil
 }
 
+// buildServerFilterConditions builds WHERE conditions from ServerFilter fields.
+func buildServerFilterConditions(filter *ServerFilter) ([]string, []any, int) {
+	var conditions []string
+	var args []any
+	argIndex := 1
+
+	if filter == nil {
+		return conditions, args, argIndex
+	}
+
+	if filter.Name != nil {
+		conditions = append(conditions, fmt.Sprintf("server_name = $%d", argIndex))
+		args = append(args, *filter.Name)
+		argIndex++
+	}
+	if filter.RemoteURL != nil {
+		conditions = append(conditions, fmt.Sprintf("EXISTS (SELECT 1 FROM jsonb_array_elements(value->'remotes') AS remote WHERE remote->>'url' = $%d)", argIndex))
+		args = append(args, *filter.RemoteURL)
+		argIndex++
+	}
+	if filter.UpdatedSince != nil {
+		conditions = append(conditions, fmt.Sprintf("updated_at > $%d", argIndex))
+		args = append(args, *filter.UpdatedSince)
+		argIndex++
+	}
+	if filter.SubstringName != nil {
+		conditions = append(conditions, fmt.Sprintf("server_name ILIKE $%d", argIndex))
+		args = append(args, "%"+*filter.SubstringName+"%")
+		argIndex++
+	}
+	if filter.Version != nil {
+		conditions = append(conditions, fmt.Sprintf("version = $%d", argIndex))
+		args = append(args, *filter.Version)
+		argIndex++
+	}
+	if filter.IsLatest != nil {
+		conditions = append(conditions, fmt.Sprintf("is_latest = $%d", argIndex))
+		args = append(args, *filter.IsLatest)
+		argIndex++
+	}
+	if len(filter.FilterValues) > 0 {
+		condition, newArgs, newArgIndex := buildFilterValuesCondition(filter.FilterValues, argIndex)
+		if condition != "" {
+			conditions = append(conditions, condition)
+			args = append(args, newArgs...)
+			argIndex = newArgIndex
+		}
+	}
+
+	return conditions, args, argIndex
+}
+
+// buildFilterValuesCondition builds a SQL OR condition for distribution type filter values.
+// It returns the condition string, any new args to append, and the updated argIndex.
+func buildFilterValuesCondition(filterValues []string, argIndex int) (string, []any, int) {
+	var filterConditions []string
+	var newArgs []any
+	// Collect package registry types for batching into a single ANY() check
+	var packageTypes []string
+	for _, fv := range filterValues {
+		switch fv {
+		case model.TransportTypeSSE, model.TransportTypeStreamableHTTP:
+			filterConditions = append(filterConditions,
+				fmt.Sprintf("EXISTS (SELECT 1 FROM jsonb_array_elements(value->'remotes') AS r WHERE r->>'type' = '%s')", fv))
+		default:
+			// Package registry types: npm, pypi, oci, nuget, mcpb
+			packageTypes = append(packageTypes, fv)
+		}
+	}
+	if len(packageTypes) > 0 {
+		filterConditions = append(filterConditions,
+			fmt.Sprintf("EXISTS (SELECT 1 FROM jsonb_array_elements(value->'packages') AS pkg WHERE pkg->>'registryType' = ANY($%d))", argIndex))
+		newArgs = append(newArgs, packageTypes)
+		argIndex++
+	}
+	if len(filterConditions) == 0 {
+		return "", nil, argIndex
+	}
+	return "(" + strings.Join(filterConditions, " OR ") + ")", newArgs, argIndex
+}
+
 func (db *PostgreSQL) ListServers(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -95,43 +176,7 @@ func (db *PostgreSQL) ListServers(
 	}
 
 	// Build WHERE clause for filtering using dedicated columns
-	var whereConditions []string
-	args := []any{}
-	argIndex := 1
-
-	// Add filters using dedicated columns for better performance
-	if filter != nil {
-		if filter.Name != nil {
-			whereConditions = append(whereConditions, fmt.Sprintf("server_name = $%d", argIndex))
-			args = append(args, *filter.Name)
-			argIndex++
-		}
-		if filter.RemoteURL != nil {
-			whereConditions = append(whereConditions, fmt.Sprintf("EXISTS (SELECT 1 FROM jsonb_array_elements(value->'remotes') AS remote WHERE remote->>'url' = $%d)", argIndex))
-			args = append(args, *filter.RemoteURL)
-			argIndex++
-		}
-		if filter.UpdatedSince != nil {
-			whereConditions = append(whereConditions, fmt.Sprintf("updated_at > $%d", argIndex))
-			args = append(args, *filter.UpdatedSince)
-			argIndex++
-		}
-		if filter.SubstringName != nil {
-			whereConditions = append(whereConditions, fmt.Sprintf("server_name ILIKE $%d", argIndex))
-			args = append(args, "%"+*filter.SubstringName+"%")
-			argIndex++
-		}
-		if filter.Version != nil {
-			whereConditions = append(whereConditions, fmt.Sprintf("version = $%d", argIndex))
-			args = append(args, *filter.Version)
-			argIndex++
-		}
-		if filter.IsLatest != nil {
-			whereConditions = append(whereConditions, fmt.Sprintf("is_latest = $%d", argIndex))
-			args = append(args, *filter.IsLatest)
-			argIndex++
-		}
-	}
+	whereConditions, args, argIndex := buildServerFilterConditions(filter)
 
 	// Add cursor pagination using compound serverName:version cursor
 	if cursor != "" {

@@ -3,6 +3,7 @@ package v0
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/modelcontextprotocol/registry/internal/database"
 	"github.com/modelcontextprotocol/registry/internal/service"
 	apiv0 "github.com/modelcontextprotocol/registry/pkg/api/v0"
+	"github.com/modelcontextprotocol/registry/pkg/model"
 )
 
 const errRecordNotFound = "record not found"
@@ -23,6 +25,7 @@ type ListServersInput struct {
 	UpdatedSince string `query:"updated_since" doc:"Filter servers updated since timestamp (RFC3339 datetime)" required:"false" example:"2025-08-07T13:15:04.280Z"`
 	Search       string `query:"search" doc:"Search servers by name (substring match)" required:"false" example:"filesystem"`
 	Version      string `query:"version" doc:"Filter by version ('latest' for latest version, or an exact version like '1.2.3')" required:"false" example:"latest"`
+	Filter       string `query:"filter" doc:"Comma-separated list of distribution type filters combined with OR logic. Reserved values: sse, streamable-http, npm, pypi, oci, nuget, mcpb." required:"false" example:"npm,pypi"`
 }
 
 // ServerDetailInput represents the input for getting server details
@@ -53,33 +56,9 @@ func RegisterServersEndpoints(api huma.API, pathPrefix string, registry service.
 		Tags:        []string{"servers"},
 	}, func(ctx context.Context, input *ListServersInput) (*Response[apiv0.ServerListResponse], error) {
 		// Build filter from input parameters
-		filter := &database.ServerFilter{}
-
-		// Parse updated_since parameter
-		if input.UpdatedSince != "" {
-			// Parse RFC3339 format
-			if updatedTime, err := time.Parse(time.RFC3339, input.UpdatedSince); err == nil {
-				filter.UpdatedSince = &updatedTime
-			} else {
-				return nil, huma.Error400BadRequest("Invalid updated_since format: expected RFC3339 timestamp (e.g., 2025-08-07T13:15:04.280Z)")
-			}
-		}
-
-		// Handle search parameter
-		if input.Search != "" {
-			filter.SubstringName = &input.Search
-		}
-
-		// Handle version parameter
-		if input.Version != "" {
-			if input.Version == "latest" {
-				// Special case: filter for latest versions
-				isLatest := true
-				filter.IsLatest = &isLatest
-			} else {
-				// Future: exact version matching
-				filter.Version = &input.Version
-			}
+		filter, err := buildListServersFilter(input)
+		if err != nil {
+			return nil, err
 		}
 
 		// Get paginated results with filtering
@@ -185,4 +164,58 @@ func RegisterServersEndpoints(api huma.API, pathPrefix string, registry service.
 			},
 		}, nil
 	})
+}
+
+// buildListServersFilter converts ListServersInput query parameters into a ServerFilter.
+func buildListServersFilter(input *ListServersInput) (*database.ServerFilter, error) {
+	filter := &database.ServerFilter{}
+
+	if input.UpdatedSince != "" {
+		if updatedTime, err := time.Parse(time.RFC3339, input.UpdatedSince); err == nil {
+			filter.UpdatedSince = &updatedTime
+		} else {
+			return nil, huma.Error400BadRequest("Invalid updated_since format: expected RFC3339 timestamp (e.g., 2025-08-07T13:15:04.280Z)")
+		}
+	}
+
+	if input.Search != "" {
+		filter.SubstringName = &input.Search
+	}
+
+	if input.Version != "" {
+		if input.Version == "latest" {
+			isLatest := true
+			filter.IsLatest = &isLatest
+		} else {
+			filter.Version = &input.Version
+		}
+	}
+
+	if input.Filter != "" {
+		filterValues, err := parseFilterParam(input.Filter)
+		if err != nil {
+			return nil, err
+		}
+		filter.FilterValues = filterValues
+	}
+
+	return filter, nil
+}
+
+// parseFilterParam parses a comma-separated filter string and validates each value.
+func parseFilterParam(raw string) ([]string, error) {
+	parts := strings.Split(raw, ",")
+	var values []string
+	for _, part := range parts {
+		v := strings.TrimSpace(part)
+		if v == "" {
+			continue
+		}
+		if !model.IsValidReservedFilterValue(v) {
+			return nil, huma.Error400BadRequest(
+				fmt.Sprintf("Invalid filter value: %q. Valid values are: %s", v, strings.Join(model.ValidFilterValues(), ", ")))
+		}
+		values = append(values, v)
+	}
+	return values, nil
 }

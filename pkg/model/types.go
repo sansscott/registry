@@ -102,6 +102,32 @@ type Argument struct {
 	IsRepeated         bool         `json:"isRepeated,omitempty" doc:"Whether the argument can be repeated multiple times."`
 }
 
+// validFilterValues is the set of recognized filter values for the list servers
+// endpoint, built from existing transport and registry type constants.
+var validFilterValues = map[string]bool{
+	TransportTypeSSE:            true,
+	TransportTypeStreamableHTTP: true,
+	RegistryTypeNPM:             true,
+	RegistryTypePyPI:            true,
+	RegistryTypeOCI:             true,
+	RegistryTypeNuGet:           true,
+	RegistryTypeMCPB:            true,
+}
+
+// ValidFilterValues returns all reserved filter value strings.
+func ValidFilterValues() []string {
+	values := make([]string, 0, len(validFilterValues))
+	for v := range validFilterValues {
+		values = append(values, v)
+	}
+	return values
+}
+
+// IsValidReservedFilterValue checks whether a string is a recognized reserved filter value.
+func IsValidReservedFilterValue(v string) bool {
+	return validFilterValues[v]
+}
+
 type Icon struct {
 	Src      string   `json:"src" required:"true" format:"uri" maxLength:"255" doc:"A standard URI pointing to an icon resource. Must be an HTTPS URL. Consumers SHOULD take steps to ensure URLs serving icons are from the same domain as the server or a trusted domain. Consumers SHOULD take appropriate precautions when consuming SVGs as they can contain executable JavaScript." example:"https://example.com/icon.png"`
 	MimeType *string  `json:"mimeType,omitempty" enum:"image/png,image/jpeg,image/jpg,image/svg+xml,image/webp" doc:"Optional MIME type override if the source MIME type is missing or generic. Must be one of: image/png, image/jpeg, image/jpg, image/svg+xml, image/webp." example:"image/png"`
