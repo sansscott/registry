@@ -77,8 +77,10 @@ func MetricTelemetryMiddleware(metrics *telemetry.Metrics, options ...Middleware
 		// Record metrics
 		metrics.Requests.Add(ctx.Context(), 1, metric.WithAttributes(attrs...))
 
-		if statusCode >= 400 {
+		if statusCode >= 500 {
 			metrics.ErrorCount.Add(ctx.Context(), 1, metric.WithAttributes(attrs...))
+		} else if statusCode >= 400 {
+			metrics.ClientErrorCount.Add(ctx.Context(), 1, metric.WithAttributes(attrs...))
 		}
 
 		metrics.RequestDuration.Record(ctx.Context(), duration, metric.WithAttributes(attrs...))

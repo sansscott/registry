@@ -27,8 +27,11 @@ type Metrics struct {
 	// RequestDuration tracks the duration of HTTP Requests
 	RequestDuration metric.Float64Histogram
 
-	// ErrorCount tracks the number of errors
+	// ErrorCount tracks the number of server errors (5xx)
 	ErrorCount metric.Int64Counter
+
+	// ClientErrorCount tracks the number of client errors (4xx)
+	ClientErrorCount metric.Int64Counter
 
 	// Up tracks the health of the service
 	Up metric.Int64Gauge
@@ -59,10 +62,18 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 
 	errCount, err := meter.Int64Counter(
 		Namespace+".http.errors",
-		metric.WithDescription("Total number of HTTP errors"),
+		metric.WithDescription("Total number of HTTP server errors (5xx)"),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create error counter: %w", err)
+	}
+
+	clientErrCount, err := meter.Int64Counter(
+		Namespace+".http.client_errors",
+		metric.WithDescription("Total number of HTTP client errors (4xx)"),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client error counter: %w", err)
 	}
 
 	up, err := meter.Int64Gauge(
@@ -74,10 +85,11 @@ func NewMetrics(meter metric.Meter) (*Metrics, error) {
 	}
 
 	return &Metrics{
-		Requests:        req,
-		RequestDuration: reqDuration,
-		ErrorCount:      errCount,
-		Up:              up,
+		Requests:         req,
+		RequestDuration:  reqDuration,
+		ErrorCount:       errCount,
+		ClientErrorCount: clientErrCount,
+		Up:               up,
 	}, nil
 }
 
