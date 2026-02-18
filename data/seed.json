@@ -1,6 +1,22 @@
 [
   {
     "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+    "name": "com.hudsonvalleyforestry/hvf-api",
+    "description": "Land clearing assessment and quote tools for residential, goat grazing, and commercial O&G projects in the Northeast US.",
+    "repository": {
+      "url": "https://github.com/sansscott/hvf-website",
+      "source": "github"
+    },
+    "version": "1.0.0",
+    "remotes": [
+      {
+        "type": "streamable-http",
+        "url": "https://mcp.hudsonvalleyforestry.com/mcp"
+      }
+    ]
+  },
+  {
+    "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
     "name": "io.github.domdomegg/airtable-mcp-server",
     "description": "Read and write access to Airtable database schemas, tables, and records.",
     "repository": {
